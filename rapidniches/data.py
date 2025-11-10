@@ -10,16 +10,17 @@ import torch
 from torch.optim import Adam
 from torch_geometric.data import Data, DataLoader
 
-
-
 class PairwiseGraphBuilder:
-    def __init__(self, X, locations, n_neighbors=10):
+    def __init__(self, X, locations, specimen=None, n_neighbors=10):
         if isinstance(locations, torch.Tensor):
             locations = locations.cpu().numpy()
+        if specimen is not None and isinstance(specimen, torch.Tensor):
+            specimen = specimen.cpu().numpy()
         
         # Setup Data
         self.X = torch.tensor(X)
         self.locations = torch.tensor(locations)
+        self.specimen = torch.tensor(specimen) if specimen is not None else None
         self.n_neighbors = n_neighbors
         self.ckd_tree = cKDTree(locations)
 
@@ -83,6 +84,20 @@ class PairwiseGraphBuilder:
         # I had some problems, now no more
         assert edge_index.max() < X.size(0), "Edge indices exceed node count!"
 
+        # Add specimen info if available
+        if self.specimen is not None:
+            specimen_label = self.specimen[self.indices[index]][0]
+        else:
+            specimen_label = -1
+
+        return Data(
+            X=masked_X,
+            edge_index=edge_index,
+            edge_attr=edge_attr,
+            target=target[None, :],
+            specimen=specimen_label
+        )
+
         return Data(
             X=masked_X,
             edge_index=edge_index,
@@ -111,44 +126,90 @@ class GraphTransformerHandler:
             'epoch_losses': []
         }
     
-    def train(self, dataloader, num_epochs=10):
-        """Train the model using the corrected training loop"""
+    @staticmethod
+    def kl_divergence_to_standard_normal(vectors: torch.Tensor, diagonal: bool = True, eps: float = 1e-6) -> torch.Tensor:
+        """
+        Computes KL divergence between a set of vectors (empirical distribution)
+        and a standard normal distribution N(0, I).
+
+        Args:
+            vectors (torch.Tensor): Tensor of shape [N, D], where N is number of samples and D is dimensionality.
+            diagonal (bool): If True, assume diagonal covariance (independent dimensions). If False, use full covariance.
+            eps (float): Small value added to diagonal for numerical stability (only for full covariance).
+
+        Returns:
+            torch.Tensor: Scalar KL divergence.
+        """
+        N, D = vectors.shape
+        mu = vectors.mean(dim=0)  # [D]
+
+        if diagonal:
+            var = vectors.var(dim=0, unbiased=False)  # [D]
+            kl = 0.5 * (var.sum() + (mu**2).sum() - D - torch.log(var).sum())
+        else:
+            cov = torch.cov(vectors.T)  # [D, D]
+            cov += eps * torch.eye(D)   # numerical stability
+            kl = 0.5 * (torch.trace(cov) + mu @ mu - D - torch.logdet(cov))
+
+        return kl
+
+    def train(self, dataloader, num_epochs=10, specimen_adversarial=False, lambda_adv=1, num_specimens=12):
         self.model.train()
+        
+        # Create adversarial discriminator if needed
+        if specimen_adversarial:
+            if num_specimens is None:
+                raise ValueError("num_specimens must be provided for adversarial batch correction")
+            self.discriminator = SpecimenDiscriminator(self.model.latent_dim, num_specimens).to(self.device)
+            self.disc_optimizer = Adam(self.discriminator.parameters(), lr=1e-3)
+            criterion_disc = torch.nn.CrossEntropyLoss()
         
         for epoch in range(num_epochs):
             epoch_loss = 0
             loop = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
 
-            for i, batch in enumerate(loop):
-                # Move batch to device
+            for batch in loop:
                 batch = batch.to(self.device)
                 
-                # Forward pass through graph transformer
+                # Forward pass
                 context = self.model.graph_forward(batch)
                 
-                # Forward pass through normalizing flow
-                log_prob = self.model.flow_forward(
-                    batch.target,
-                    context=context
-                )
+                # KL divergence (latent regularization)
+                kl_div = self.kl_divergence_to_standard_normal(context)
                 
-                # Calculate loss
-                batch_loss = -log_prob.mean()
+                # Flow loss
+                log_prob = self.model.flow_forward(batch.target, context=context)
+                batch_loss = -log_prob.mean() + kl_div
+                
+                # Adversarial specimen loss
+                if specimen_adversarial and hasattr(batch, 'specimen'):
+                    # Apply GRL
+                    adv_input = grad_reverse(context, lambda_=lambda_adv)
+                    disc_pred = self.discriminator(adv_input)
+                    specimen_labels = batch.specimen.to(self.device).long()
+                    adv_loss = criterion_disc(disc_pred, specimen_labels)
+                    
+                    # Combine losses
+                    batch_loss += lambda_adv * adv_loss
 
-                # Backward pass
+                    # Update discriminator
+                    self.disc_optimizer.zero_grad()
+                    adv_loss.backward(retain_graph=True)
+                    self.disc_optimizer.step()
+                
+                # Backward pass for main model
                 self.optimizer.zero_grad()
                 batch_loss.backward()
                 self.optimizer.step()
-
-                # Track losses
+                
                 epoch_loss += batch_loss.item()
                 self.training_history['batch_losses'].append(batch_loss.item())
                 loop.set_postfix({"Batch Loss": f"{batch_loss.item():.4f}"})
-
+            
             epoch_avg_loss = epoch_loss / len(dataloader)
             self.training_history['epoch_losses'].append(epoch_avg_loss)
             print(f"Epoch {epoch+1} Loss: {epoch_avg_loss:.4f}")
-    
+
     def _create_unshuffled_dataloader(self, dataloader):
         """Temporarily create an unshuffled version of the dataloader"""
         # Get the original dataset from the dataloader
@@ -400,3 +461,32 @@ class GraphTransformerHandler:
     def get_device(self):
         """Get the device the model is on"""
         return self.device
+
+
+
+from torch.autograd import Function
+
+class GradientReversalFunction(Function):
+    @staticmethod
+    def forward(ctx, x, lambda_):
+        ctx.lambda_ = lambda_
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.neg() * ctx.lambda_, None
+
+def grad_reverse(x, lambda_=1.0):
+    return GradientReversalFunction.apply(x, lambda_)
+
+class SpecimenDiscriminator(torch.nn.Module):
+    def __init__(self, latent_dim, num_specimens):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(latent_dim, latent_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(latent_dim, num_specimens)
+        )
+
+    def forward(self, x):
+        return self.net(x)
