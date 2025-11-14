@@ -87,7 +87,7 @@ class GraphTransformer(nn.Module):
         # Project our input to a larger hidden dimension.
         x = F.relu(self.input_proj(x))
 
-        # FIXME: choice of 100 seems arbitrary, could be better.
+        # FIXME: choice of 100 _is_ arbitrary, could be better.
         edge_attr = edge_attr.view(-1, 1).float() / distance_normalization
 
         # Graph Attention + Dropout + Layer Normalization.

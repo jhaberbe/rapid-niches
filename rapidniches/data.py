@@ -8,6 +8,7 @@ from scipy.spatial import cKDTree
 
 import torch
 from torch.optim import Adam
+from torch.autograd import Function
 from torch_geometric.data import Data, DataLoader
 
 class PairwiseGraphBuilder:
@@ -72,7 +73,8 @@ class PairwiseGraphBuilder:
         X = self.X[self.indices[index]].clone()
 
         # Trying to avoid having the graph just pass information about the center node
-        # Under global pooling conditions, I doubt it would ever actually leak, but I
+        # Under global pooling conditions, I doubt it would ever actually leak in a 
+        # due to the mixing that is going to go on, but I'm not going to risk that. I
         # also want to see if it would work if I only pass the center node's learned
         # embedding. 
         target = X[0]
@@ -81,7 +83,7 @@ class PairwiseGraphBuilder:
         local_positions = self.locations[self.indices[index]]  # fixed typo
         edge_index, edge_attr = self._fully_connected_graph(local_positions)
 
-        # I had some problems, now no more
+        # I had some problems, now no more.
         assert edge_index.max() < X.size(0), "Edge indices exceed node count!"
 
         # Add specimen info if available
@@ -461,10 +463,6 @@ class GraphTransformerHandler:
     def get_device(self):
         """Get the device the model is on"""
         return self.device
-
-
-
-from torch.autograd import Function
 
 class GradientReversalFunction(Function):
     @staticmethod
