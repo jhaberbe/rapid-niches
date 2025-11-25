@@ -10,3 +10,5 @@ wheels/
 .venv
 notebook/checkpoint.pth
 notebook/saved_model
+
+data/
