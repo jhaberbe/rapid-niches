@@ -173,31 +173,34 @@ class GraphTransformerHandler:
             for batch in loop:
                 batch = batch.to(self.device)
                 
-                # Forward pass
-                context = self.model.graph_forward(batch)
-                
-                # KL divergence (latent regularization)
-                kl_div = self.kl_divergence_to_standard_normal(context)
-                
-                # Flow loss
-                log_prob = self.model.flow_forward(batch.target, context=context)
-                batch_loss = -log_prob.mean() + kl_div
-                
                 # Adversarial specimen loss
                 if specimen_adversarial and hasattr(batch, 'specimen'):
-                    # Apply GRL
-                    adv_input = grad_reverse(context, lambda_=lambda_adv)
-                    disc_pred = self.discriminator(adv_input)
+
+                    # Forward pass
+                    context = self.model.graph_forward(batch)
+
+                    # Apply GRL, detach prevents grads through encoder head.
+                    disc_pred = self.discriminator(context.detach())
                     specimen_labels = batch.specimen.to(self.device).long()
                     adv_loss = criterion_disc(disc_pred, specimen_labels)
                     
-                    # Combine losses
-                    batch_loss += lambda_adv * adv_loss
-
                     # Update discriminator
                     self.disc_optimizer.zero_grad()
-                    adv_loss.backward(retain_graph=True)
+                    adv_loss.backward()
                     self.disc_optimizer.step()
+                
+                # Forward pass
+                context = self.model.graph_forward(batch)
+                
+                adv_loss = criterion_disc(
+                    self.discriminator(grad_reverse(context)),
+                    batch.specimen.to(self.device).long()
+                )
+ 
+                # Flow loss
+                log_prob = self.model.flow_forward(batch.target, context=context)
+                kl_div = self.kl_divergence_to_standard_normal(context)
+                batch_loss = -log_prob.mean() + kl_div + adv_loss * lambda_adv
                 
                 # Backward pass for main model
                 self.optimizer.zero_grad()

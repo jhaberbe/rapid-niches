@@ -21,6 +21,7 @@ class GraphTransformer(nn.Module):
         super().__init__()
         self.num_layers = num_layers
         self.dropout = dropout
+        self.latent_dim = out_channels
 
         # Graph Attention Setup
         # Input projection onto larger graph representation.
